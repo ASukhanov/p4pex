@@ -11,7 +11,7 @@ Grab the project from github an start the softIocPVA as:
 
     python -m p4pex.simscope -l
 
-From another terminal at acndvm04:
+From another terminal:
 
     python -m p4p.client.cli get simScope1:WaveForm_RBV
     python -m p4p.client.cli put simScope1:NoiseAmplitude=10
