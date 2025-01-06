@@ -1,6 +1,6 @@
 '''EPICS p4p-based softIocPVA of a simulated oscilloscope, similar to asyn/testAsynPortDriverApp.
 '''
-__version__= 'v0.0.3 2024-12-29'# waveform and NoiseAmplitude are working.
+__version__= 'v0.1.2 2025-01-05'# Handling of Run Start/Stop. 
 
 import argparse, time, threading
 import numpy as np
@@ -16,17 +16,24 @@ SleepTime = 1.
 EventExit = threading.Event()
 MaxPoints = 100
 
-#``````````````````Variables``````````````````````````````````````````````````
+#``````````````````Module properties``````````````````````````````````````````
 class G():
+    PVs = {}
     cycle = 0
-    noiseLevel = 0.1
+    noiseLevel = 1.
     #timeArray = np.linspace(0.,1.,MaxPoints)
     timeArray = np.arange(MaxPoints)
     peaksParameters = None
+    threadProc = None
 
     def set_noise(level):
-        print(f'>set_noise {level}')
         G.noiseLevel = level
+
+    def set_run(vntenum):
+        idx = vntenum.raw.value.index
+        #print(f">set_run {idx}")
+        if idx == 0:# Run
+            threading.Thread(target=G.threadProc).start()
 
 #``````````````````Argument parsing```````````````````````````````````````````
 parser = argparse.ArgumentParser(description = __doc__,
@@ -103,38 +110,44 @@ def NTA(t): return NTScalar('a'+typeCode[t],display=True)
 PVDefs = [
 ['Run', 'Start/Stop the device',
     NTEnum(),#DNW:display=True),
-    {'choices': ['Run','Stop'], 'index': 0},'WE',{}],
-['VoltOffset', '', NTS('F32'), 0., 'WE',{'units':'V'}],
+    {'choices': ['Run','Stop'], 'index': 0},'WE',
+    {'setter': G.set_run}],
+['VoltOffset', 'Not operational', NTS('F32'), 0., 'WE', {'units':'V'}],
 #['VoltOffset_RBV', '', NTS('F32'), 0., 'R',{}],
-['VoltsPerDivSelect', '',NTS('F32'), 0., 'WE',{}],
+['VoltsPerDivSelect', 'Vertical scale',  NTEnum(),
+    {'choices': ['0.1','0.2','0.5','1.0'], 'index':0}, 'WE', {'units':'V'}],
 #['VoltsPerDivSelect_RBV', '', NTS('F32'), 0., 'R',{}],
-['TimePerDivSelect', '', NTEnum(),
+['TimePerDivSelect', 'Not operational', NTEnum(),
     {'choices': '0.01 0.02 0.05 0.1 0.2 0.5 1 2 5'.split(),
-    'index': 0},'WE',{}],
-['TimePerDivSelect_RBV', '', NTS('F32'), 0., 'R',{}],
-['VertGainSelect', '', NTS('F32'), 0., 'WE',{}],
-['TriggerDelay', '', NTS('F32'), 0., 'WE',{}],
-['NoiseAmplitude', '', NTS('F32'), G.noiseLevel, 'WE',{'setter':G.set_noise}],
-['UpdateTime', '', NTS('F32'), 0., 'WE',{'limitLow':0.001,'limitHigh':10.1}],
-['WaveForm_RBV', '', NTA('F32'), [0.], 'R',{}],
-['TimeBase_RBV', '', NTA('F32'), [0.], 'R',{}],
-['MaxPoints_RBV', '', NTS('U16'), MaxPoints, 'R',{}],
-['MinValue_RBV', '', NTS('F32'), 0., 'R',{}],
-['MaxValue_RBV', '', NTS('F32'), 0., 'R',{}],
-['MeanValue_RBV', '', NTS('F32'), 0., 'R',{}],
-['threads', 'Number of threads', NTS('U8'), 0, 'R',{}],
+    'index': 0},'WE',{'units':'s'}],
+['TimePerDivSelect_RBV', 'Not operational', NTS('F32'), 0., 'R',{}],
+['VertGainSelect', 'Not operational', NTS('F32'), 0., 'WE', {'units':'V/div'}],
+['TriggerDelay', 'Not operational', NTS('F32'), 0., 'WE', {'units':'s'}],
+['NoiseAmplitude', 'Noise level', NTS('F32'), G.noiseLevel, 'WE',
+    {'setter':G.set_noise, 'limitLow':-100., 'limitHigh':100., 'units':'V'}],
+['UpdateTime', 'Not operational',
+    NTS('F32'), 0., 'WE', {'limitLow':0.001, 'limitHigh':10., 'units':'s'}],
+['Waveform_RBV', 'Waveform array', NTA('F32'), [0.], 'R',{}],
+['TimeBase_RBV', 'Timebase array, synchronous with Waveform_RBV',
+    NTA('F32'), [0.], 'R',{}],
+['MaxPoints_RBV', 'Number of points in Waveorm_RBV',
+    NTS('U16'), MaxPoints, 'R',{}],
+['MinValue_RBV', 'Waveform min', NTS('F32'), 0., 'R',{}],
+['MaxValue_RBV', 'Waveform max', NTS('F32'), 0., 'R',{}],
+['MeanValue_RBV', 'Waveform mean', NTS('F32'), 0., 'R',{}],
+['threads', 'Number of threads running in this softIocPVA',
+    NTS('U8'), 0, 'R', {'units':'threads'}],
 ['cycle',   'Cycle number', NTS('U32'), '0', 'R',{}],
 ]
 ts = time.time()
 
 #``````````````````create_PVs()```````````````````````````````````````````````
-PVs = {}
 for defs in PVDefs:
     pname,desc,nt,ivalue,features,extra = defs
     writable = 'W' in features
     #print(f'creating pv {pname}, writable: {writable}, initial: {ivalue}, extra: {extra}')
     pv = SharedPV(nt=nt)
-    PVs[P+pname] = pv
+    G.PVs[P+pname] = pv
     pv.open(ivalue)
     #if isinstance(ivalue,dict):# NTEnum
     if isinstance(nt,NTEnum):# NTEnum
@@ -159,7 +172,6 @@ for defs in PVDefs:
     if writable:
         @pv.put
         def handle(pv, op):
-            print(f'put,handle {pv.name}')
             ct = time.time()
             v = op.value()
             vr = v.raw.value
@@ -171,34 +183,40 @@ for defs in PVDefs:
                 printi(f'putting {pv.name} = {vr}')
             pv.post(vr, timestamp=ct) # update subscribers
             op.done()
-
 #,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,
 if pargs.listPVs:
     print('List of PVs:')
-    pprint.pp(list(PVs.keys()))
+    pprint.pp(list(G.PVs.keys()))
 
 def myThread_proc():
     threads = 0
+    printi('Run started')
     while not EventExit.is_set():
         G.cycle += 1
         #print(f'cycle {G.cycle}')
         tc = threading.active_count()
         if threads != tc:
             threads = tc
-            PVs[P+'threads'].post(threads)
-        PVs[P+'cycle'].post(G.cycle)
+            G.PVs[P+'threads'].post(threads)
+        G.PVs[P+'cycle'].post(G.cycle)
 
         # update waveform
         ts = time.time()
         wf = get_waveForm()
         #pprint.pp(wf)
-        PVs[P+'WaveForm_RBV'].post(wf, timestamp=ts)
-        PVs[P+'TimeBase_RBV'].post(G.timeArray, timestamp=ts)
+        G.PVs[P+'Waveform_RBV'].post(wf, timestamp=ts)
+        G.PVs[P+'TimeBase_RBV'].post(G.timeArray, timestamp=ts)
+        G.PVs[P+'MinValue_RBV'].post(wf.min(), timestamp=ts)
+        G.PVs[P+'MeanValue_RBV'].post(wf.mean(), timestamp=ts)
+        G.PVs[P+'MaxValue_RBV'].post(wf.max(), timestamp=ts)
+        if str(G.PVs[P+'Run'].current())!='Run':
+            break
         EventExit.wait(SleepTime)
+    printi('Run stopped')
     return
 
-myThread = threading.Thread(target=myThread_proc)
-#myThread.daemon = True
-myThread.start()
-Server.forever(providers=[PVs]) # runs until KeyboardInterrupt
+G.threadProc = myThread_proc
+thread = threading.Thread(target=myThread_proc).start()
+
+Server.forever(providers=[G.PVs]) # runs until KeyboardInterrupt
 
